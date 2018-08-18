@@ -1,0 +1,349 @@
+---
+title: "Sampling distribution"
+author:
+- Alexis Angel
+- Lin Zuo 
+- Ruoqian Xiong
+
+output: 
+  html_document: 
+    highlight: pygments
+    theme: flatly
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(grid)
+library(gridExtra)
+library(rvest)
+library(magrittr)
+library(stringr)
+source("https://stat.duke.edu/~cr173/Sta112_Fa16/code/one_prop_test.R")
+
+load("movies.Rdata")
+```
+
+To give suggestions on how to spend money, we first want to categorize different goals Paramount Pictures want to achieve. That's why we define three cateria: public ratings, oscar winnings and profits. The goal of our project is to find out attributes that could contribute to the above three criteria. After doing analysis, we used shiny app as a complement, to demonstrate how those attributes we found influence each criterion. For the two numerical criteria (public ratings and profits), we can plot graphs that include a numerical predictor and a categorical predictor in Shiny. We also fit the linear regression between the numerical criteria and the numerical predictor in the plot. For the categorical criteria, oscar winnings, we can plot boxplots that demonstrate relationship between it and other numerical predictors.
+
+This R Markdown document is organized in this way that Part I is about data scraping and processing, Part II is the analysis about public ratings, Part III is the analysis about oscar winning, Part IV is the analysis about profitability and Part V is the critique about our methods. 
+
+
+<h1>Part I: Data Scraping and Processing</h1>
+To gather more information, we first scraped box office and budget from IMDB website. Then, we calculated the profit by subtracting budget from the box office to decide whether a movie is profitable or not. 
+
+We also scrapped the number of votes for audience score on Rotten Tomatoes so that we could later compare the reliability between Rotten Tomatoes and IMDB.
+
+Besides, we figured that not only best picture award, but also best actor/actress award and best director award could raise the reputation of movie, so we created a new column "award" to define whether a movie won any kind of Oscar awards. It would be categorized as "yes" in the column "award" if it won any kind of Oscar.
+
+```{r}
+
+movies %<>% mutate(box_office=NA)
+movies %<>% mutate(budget=NA)
+
+for(i in 1:nrow(movies)) {
+  url = movies$imdb_url[i]
+  page = read_html(url)
+  
+  #Box office scraping
+  box_office = page %>% 
+    html_nodes("#titleDetails") %>%
+    html_text() %>% 
+    str_trim() %>%
+    str_extract("Gross:        .([0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,[0-9]{3})") %>%
+    str_extract("([0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,[0-9]{3})") %>%
+    str_replace_all(",", "") %>%
+    as.numeric()
+  movies$box_office[i] = box_office
+  
+  #Budget scraping
+  budget = page %>% 
+    html_nodes("#titleDetails") %>%
+    html_text() %>% 
+    str_trim() %>%
+    str_extract("Budget:        .([0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,[0-9]{3})") %>%
+    str_extract("([0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,?[0-9]?[0-9]?[0-9]?,[0-9]{3})") %>%
+    str_replace_all(",", "") %>%
+    as.numeric()
+  movies$budget[i] = budget
+}
+
+#Profit Calculation
+
+movies %<>%
+  mutate(profit = box_office-budget)
+
+#Scrape the number of votes for audience score on Rotten Tomatoes
+for (i in 1:nrow(movies)){
+  movies$rt_url[i] = movies$rt_url[i] %>% paste0("http:", .)
+  movie_url = as.character(movies$rt_url[i])
+  page = read_html(movie_url)
+  movies$rt_num_votes[i] = page %>% html_nodes(".superPageFontColor div+ div") %>% html_text() %>% str_replace("User Ratings:", "") %>% str_replace_all(",", "") %>% as.numeric()
+}
+
+#create a new column "award"
+for (i in 1:nrow(movies)){
+  movies$award[i] = "no"
+  if (movies$best_actor_win[i]=="yes" | movies$best_actress_win[i]=="yes" | movies$best_dir_win[i]=="yes" | movies$best_pic_win[i]=="yes") {
+    movies$award[i] = "yes"
+  }
+}
+
+save (movies, file = "movies_update.RData")
+load ("movies_update.RData")
+```
+
+<h1>Part II: Find attributes that contribute to the first criterion: public's ratings</h1>
+```{r}
+# Side-by-side boxplot of number of votes on IMDB and RT
+g7 = ggplot(data=movies, aes(x="", y=log(imdb_num_votes))) + geom_boxplot()
+g8 = ggplot(data=movies, aes(x="", y=log(rt_num_votes))) + geom_boxplot()
+grid.arrange(g7, g8, ncol=2)
+summary(movies$imdb_num_votes)
+summary(movies$rt_num_votes)
+```
+First, we determine that the public rating on Rotten Tomatoes is more influential/popular because significantly more users review movies on Rotten Tomatoes.
+
+```{r}
+# Linear model for predicting movies' rating
+  # removed title, director, actor1-5, urls, audience_rating, imdb_rating, critics_rating, critics_score, thtr_rel_year, dvd_rel_year
+movies_modified = na.omit(movies) %>% select(title_type, genre, runtime, mpaa_rating, studio, thtr_rel_month, thtr_rel_day, dvd_rel_month, dvd_rel_day, imdb_num_votes,  audience_score, best_pic_nom, best_pic_win, best_actor_win, best_actress_win, top200_box)
+
+step(lm((audience_score)~., data=movies_modified), direction = "backward")
+
+summary(lm(formula = (audience_score) ~ genre + mpaa_rating + dvd_rel_month + 
+    imdb_num_votes + best_pic_nom, data = movies_modified))$r.squared
+```
+Before determining a linear model to predict the public rating of movies, we need to justify why several variables are excluded from the group of candidate predictors: `title`, `director`, `actor1`,`actor2`,`actor3`,`actor4`,`actor5` are excluded because these variables contain too many levels, most of which only account for a single movie; therefore, although including these variables as candidate predictors will increase our model fit, they are not valid candidates for a generalized linear model. The two url variables are also removed, because they should not affect the rating of a movie in any way. The variables `audience_rating`, `imdb_rating`, `critics_rating` are excluded, because it is meaningless to use other public ratings to predict the public rating of interest here (`audience_score`); nevertheless, we recognize that critics rating and score do not count strictly as public ratings and may affect `audience_score`, but we do not believe that these two variables can be (legally) actively controlled by Paramount Pictures. The last group of variables we exclude contains `thtr_rel_year` and `dvd_rel_year`, because even if they turn out to be statistically meanful predictors, the movie producer cannot go back in time to release their movies in order to earn a higher rating. 
+Then, using backward selection, we determine the attributes that contribute to public rating (from Rotten Tomatoes) are: `genre`, `mpaa_rating`, `dvd_rel_month`, `imdb_num_votes`, `best_pic_nom`. The R-squared value of this final linear model is 0.345, meaning this model explains about 34.5% of the variability of public rating. 
+
+An extra finding - we need to bribe critics
+```{r}
+#Is it worth to bribe the Rotten Tomatoes critics? Yes.
+model = lm(critics_score ~ audience_score, data=movies)
+summary(model)$r.squared
+```
+Although we excluded `critics_score` and `critics_rating` in the model above, we found out that there is fairly strong relationship between how critics rate the movies and how the audience rate the movies (r-squared value equals to 0.496). Considering that in reality bribing the critics is not impossible, we calculate a second model where we include `critics_score` and `critics_rating` as candidate predictors:
+
+```{r}
+# Linear model for predicting movies' rating
+  # removed title, director, actor1-5, urls, audience_rating, imdb_rating, thtr_rel_year, dvd_rel_year
+movies_modified = na.omit(movies) %>% select(title_type, genre, runtime, mpaa_rating, studio, thtr_rel_month, thtr_rel_day, dvd_rel_month, dvd_rel_day, imdb_num_votes,  audience_score, best_pic_nom, best_pic_win, best_actor_win, best_actress_win, top200_box, critics_rating, critics_score)
+
+step(lm((audience_score)~., data=movies_modified), direction = "backward")
+
+summary(lm(formula = (audience_score) ~ genre + dvd_rel_day + imdb_num_votes + 
+    critics_score, data = movies_modified))$r.squared
+```
+The r-squared value for the second model is 0.563. We can see that adding `critics_score` and `critics_rating` to the group of candidate predictors will significantly increase our model's ability to explain the variation in public rating. In addition, the meaningful predictors also change from those in the first model--here, the attributes that contribute to public rating are `genre`, `dvd_rel_day`, `imdb_num_votes` and `critics_score`.
+
+```{r}
+# Some visualizations that show the relationship between public rating and its meaningful predictors
+ggplot(data=movies, aes(x=imdb_num_votes, y=audience_score)) + scale_x_log10() + geom_point(alpha = 0.5) + stat_smooth(method = "lm", se=FALSE)
+fit_votes_score <- lm(imdb_num_votes~audience_score, data=movies)
+summary(fit_votes_score)$r.squared
+
+ggplot(data=movies, aes(x=genre, y=audience_score, fill=genre)) + geom_boxplot()
+
+ggplot(data = movies, aes(y=audience_score, x=best_pic_nom, col=best_pic_nom)) + scale_y_log10() +
+geom_boxplot()+ facet_wrap(~genre)
+
+ggplot(data = movies, aes(x=audience_score, col=mpaa_rating, fill=mpaa_rating)) +
+  geom_histogram(bins=20) +
+  scale_x_log10() + 
+  facet_grid(mpaa_rating~.)
+```
+
+From the first graph we can see that the number of votes on imdb has a weak but positive impact on the movies' public rating (the r-squared value for the linear fit is 0.0840). We can observe from the second graph that drama movies tend to receive high public ratings among all genre of movies, while horror movies tend to score low. The third visualization illustrates that movies with Oscar nomination for Best Picture, across all genre, tend to receive better public reputation. The last graph shows that in general, the distribution of public ratings is left skewed across all MPAA ratings, except that public ratings of G and NC-17 movies seem to be evenly distributed across the range. 
+
+<h1>Part III: Find attributes that contribute to the second criterion: Oscar winning</h1>
+
+#Relationship between title type and oscar winning.
+Becuase title type is a three level categorical variable and oscar winning is a binary variable, so we can only use bootstrapping to get qualitative conclusions.
+```{r}
+documentary <- movies%>%filter(title_type == "Documentary")%>%select(title_type, award)%>%na.omit()
+boot_dist_doc = data.frame(stat = rep(NA, 15000))
+for(i in 1:15000)
+{
+  boot_sample = sample(documentary$award, size = nrow(documentary), replace = TRUE)
+  boot_dist_doc$stat[i] = sum(boot_sample == "yes") / nrow(documentary)
+}
+boot_dist_doc%>%summary(mean=mean(stat))
+
+feature <- movies%>%filter(title_type == "Feature Film")%>%select(title_type, award)%>%na.omit()
+boot_dist_fea = data.frame(stat = rep(NA, 15000))
+for(i in 1:15000)
+{
+  boot_sample = sample(feature$award, size = nrow(feature), replace = TRUE)
+  boot_dist_fea$stat[i] = sum(boot_sample == "yes") / nrow(feature)
+}
+boot_dist_fea%>%summary(mean=mean(stat))
+
+tv_movie <- movies%>%filter(title_type == "TV Movie")%>%select(title_type, award)%>%na.omit()
+boot_dist_tv = data.frame(stat = rep(NA, 15000))
+for(i in 1:15000)
+{
+  boot_sample = sample(tv_movie$award, size = nrow(tv_movie), replace = TRUE)
+  boot_dist_tv$stat[i] = sum(boot_sample == "yes") / nrow(tv_movie)
+}
+boot_dist_tv%>%summary(mean=mean(stat))
+
+boot_dist_title_type
+
+b1=ggplot(data=boot_dist_doc, aes(x=stat))+geom_histogram(bins=10)
+b2=ggplot(data=boot_dist_fea, aes(x=stat))+geom_histogram(bins=10)
+b3=ggplot(data=boot_dist_tv, aes(x=stat))+geom_histogram(bins=8)
+
+grid.arrange(b1, b2, b3, ncol=3)
+
+```
+By bootstrapping the proportion of oscar awards for each category (documentary, feature film, tv movie), we found that qualitatively, feature films would be more likely to win Oscar while documentary would be less likely to win Oscar.
+
+#Relationship between runtime and oscar winning.
+
+Check conditions: 
+Independence: The dataset has a reasonably random sample. Sample sizes of the movies with oscar and the movies without oscar are less than 10% of all the movies, so we can assume that the respondents in this sample are independent of each other. 
+Sample size / skew: The sample sizes for the movies with oscars and the movies without oscars are large enough (>30) for the sampling distribution to be nearly normal.
+```{r}
+ggplot(data = movies, aes(y=runtime, x=award, col=award)) + geom_boxplot()
+t.test(movies$runtime ~ movies$award, mu = 0, alternative = "two.sided")
+```
+We are 95% confident that movies that won Oscars are generally 11.69510 to 18.56375 minutes longer than movies that didn't win Oscars.
+
+#Relationship between IMDB rating and oscar winning.
+Check conditions: 
+Independence: The dataset has a reasonably random sample. Sample sizes of the movies with oscars and the movies without oscars are less than 10% of all movies, so we can assume that the respondents in this sample are independent of each other. 
+Sample size / skew: The sample sizes for the movies with oscars and the movies without oscars are large enough (>30) for the sampling distribution to be nearly normal.
+```{r}
+ggplot(data = movies, aes(y=imdb_rating, x=award, col=award)) +
+  geom_boxplot()
+
+oscar_ratings <- movies%>%select(award, imdb_rating)%>%na.omit()
+
+t.test(oscar_ratings$imdb_rating ~ oscar_ratings$award, mu = 0, alternative = "two.sided")
+```
+We are 95% confident that movies with oscar awards are 0.06774357 to 0.41260731 higher in IMDB rating than movies without oscar awards.
+
+#Relationship between profits and Oscar
+
+First, we made the profit into a binary variable.
+```{r}
+high_profit <- movies%>% 
+  select(award, profit)%>%
+  na.omit()%>%
+  filter(profit>0 | profit == 0)%>%
+  mutate(profit = "profitable" )
+low_profit <- movies%>% 
+  select(award, profit)%>%
+  na.omit()%>%
+  filter(profit<0)%>%
+  mutate(profit = "unprofitable")
+oscar_profit <- full_join(high_profit, low_profit, by = c ("award","profit"))
+```
+
+##how Oscar affects profit
+Check conditions: 
+Independence: The dataset uses a reasonably random sample. Sample sizes of the movies with oscars and the movies without oscars are less than 10% of all movies, so we can assume that the respondents in this sample are independent of each other. 
+Sample size / skew: The sample sizes for the movies with oscars and the population without oscars are large enough (>30) for the sampling distribution to be nearly normal.
+```{r}
+table(oscar_profit$award, oscar_profit$profit) %>% addmargins()
+(oscar_profit_summ = oscar_profit %>% 
+  group_by(award) %>%
+  summarise(x = sum(profit == "profitable"), n = length(profit), p_hat = x / n))
+
+prop.test(x = c(oscar_profit_summ$x[1], oscar_profit_summ$x[2]), n = c(oscar_profit_summ$n[1], oscar_profit_summ$n[2]), correct = FALSE)
+```
+The p value is 0.301, so we can not reject the null hypothesis that there are no difference in terms of profits of movies between movies that have oscars and movies without oscars.
+
+##how profit affects oscar
+Check conditions: 
+Independence: The dataset uses a reasonably random sample. Sample sizes of the movies with oscars and the movies without oscars are less than 10% of all movies, so we can assume that the respondents in this sample are independent of each other. 
+Sample size / skew: The sample sizes for the movies with oscars and the population without oscars are large enough (>30) for the sampling distribution to be nearly normal.
+```{r}
+table(oscar_profit$award, oscar_profit$profit) %>% addmargins()
+(oscar_profit_summ = oscar_profit %>% 
+  group_by(profit) %>%
+  summarise(x = sum(award == "yes"), n = length(award), p_hat = x / n))
+
+prop.test(x = c(oscar_profit_summ$x[1], oscar_profit_summ$x[2]), n = c(oscar_profit_summ$n[1], oscar_profit_summ$n[2]), correct = FALSE)
+```
+The p value is 0.301, so we can not reject the null hypothesis that there are no difference in terms of oscar winnings of movies between movies that gain profits and movies that aren't profitable.
+
+Therefore, there's no relationship between oscar winnings and profits.
+
+In conclusion, if we want a movie to win Oscar, it should have a relatively longer time and higher imdb rating. Qualitatively speaking, feature films have more chance to win an Oscar. Also, because profit is not related to Oscar, even if a movie is not profitable, it still has chance to win an Oscar. 
+
+<h1>Part IV: Find attributes that contribute to the third criterion: profitability</h1>
+
+<p>We will use absolute profit (box_office-budget) to quantify profitability for movies. Our goal here is to identify how to make a blockbuster</p>
+<p>First, let's look at how many movies are actually profitable. It turns out that about half of the movies make profit, and the other half doesn't. However, the odds are stacked in our favor, because if we make a losing movie, we can expect to lose about 9 million dollars, but if we make a winning movie we can expect to make 19 million dollars. That looks like a winning bet, but let's try to make it even more of a winning bet.</p>
+
+<p>Looking at title_type, we can see that feature films is where the money is. Documentaries seem to make very little money, as the boxplot is narrowly centered around 0. We recommend producing feature films.</p>
+<p>Looking at genres, it looks like Animation, Other, and SciFi and Fantasy movies are high-grossing and profitable most of the time (at least 75% of the time). Now, if you are looking for more speculative investments, drama movies might be a good bet, as they can gross considerably more money. Now, considering risk-adjusted returns, we recommend Animation, Other, and SciFi and Fantasy movies.</p>
+<p>Looking at the graph for profit v. runtime, we can see a bump upward near 120 minutes. The upward tail at the end might not be significant, although it seems there is a probability of higher returns for the 2.5h-3h range (remember how long James Bond movies have been recently?). We still recommend sticking to about 2h running time.</p>
+<p>G and PG movies seem to be consistently profitable (over 75% of the time), compared to R rated movies. If you want a more speculative investment, go for PG13, and you might have very high returns. We recommend you stick to those PG animation and sci-fi movies (Star Trek movies and pixar movies are PG, for your information).</p>
+<p>When it comes to the month of the movie release, December seems like a no brainer, followed by November, May, June and July. This almost looks like the two biggest school breaks of the year.</p>
+<p>Looking at the preferred release day, it looks like releasing the movie around the 17-20 of the month is a good bet: there is a little bump right there.</p>
+<p>Looking at ratings now, it seems like making a good movie does pay off (surprise). There is a positive correlation between ratings and profit. Especially if it's certified fresh in which case your movie will almost certainly be profitable.</p>
+<p>Now Oscars seem to make a significant difference when it comes to best picture nomination, best picture win, or best actress win. Somehow the nomination for best picture seems more important than actually winning the Oscar. Maybe it just means it's a good movie. We recommend you strive to make a movie worthy of being nominated for best picture. Oh and don't forget a good actress too.</p>
+<p>Spending more does not mean making more money. In fact, spening more money only increases your probability of losing more, unless you go for a spending spree and then you might make a lot of money (if you believe the tail at the right of the graph is significant). We recommend keeping the budget average, around 31 million dollars.</p>
+<p>The reason we didn't use a linear model here is that it makes no sense. Look at the percentage of distinct values for directors and actors: consistently over 70%. The models would have great fit and great adjusted R-square, but no predicting power. Also worth mentioning is that movies are not like cake recipes: you can't just use various ingredients and see what happens. In other words, if the model says you should produce an animation movie rated R with Martin Scorsese as a director and DiCaprio as an actor, we recommend you don't do it.</p>
+
+<p>Now remind me why Passengers is PG13 116 minute long sci-fi movie with a budget of $120 million released on the 21th of December with Jennifer Lawrence who won the Oscar for best actress?</p>
+
+```{r}
+
+#Subset the initial dataset
+prft_mv = movies %>% filter(is.na(profit) == FALSE)
+
+#How many movies are profitable? About half
+prft_mv %<>% mutate(profitable=ifelse(profit>0, "yes", "no"))
+prft_mv %>% group_by(profitable) %>% summarise(count=n(), median(profit))
+ggplot(data=prft_mv, aes(x=profit)) + geom_histogram(bins=20)
+
+#Boxplot for title_type
+ggplot(data=prft_mv, aes(x=title_type, y=profit, color=title_type)) + geom_boxplot()
+
+#Boxplot for genre
+ggplot(data=prft_mv, aes(x=genre, y=profit, color=genre)) + geom_boxplot()
+
+#Runtime
+ggplot(data=prft_mv, aes(x=runtime, y=profit)) + geom_point() + geom_smooth()
+
+#Boxplot for mpaa_rating
+ggplot(data=prft_mv, aes(x=mpaa_rating, y=profit, color=mpaa_rating)) + geom_boxplot()
+
+#Theater release day and month
+ggplot(data=prft_mv, aes(x=factor(thtr_rel_month), y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=thtr_rel_day, y=profit)) + geom_point() + geom_smooth()
+
+#Boxplot for ratings
+ggplot(data=prft_mv, aes(x=critics_score, y=profit)) + geom_point() + geom_smooth()
+ggplot(data=prft_mv, aes(x=audience_score, y=profit)) + geom_point() + geom_smooth()
+ggplot(data=prft_mv, aes(x=imdb_rating, y=profit)) + geom_point() + geom_smooth()
+ggplot(data=prft_mv, aes(x=critics_rating, y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=audience_rating, y=profit)) + geom_boxplot()
+
+#Oscars
+ggplot(data=prft_mv, aes(x=best_pic_nom, y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=best_pic_win, y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=best_actor_win, y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=best_actress_win, y=profit)) + geom_boxplot()
+ggplot(data=prft_mv, aes(x=best_dir_win, y=profit)) + geom_boxplot()
+
+# Does spending more mean more profit?
+ggplot(data=prft_mv, aes(x=budget, y=profit)) + geom_point() + geom_smooth()
+prft_mv %>% summarise(median(budget), mean(budget))
+
+#The problem with director and actors is there is a high percentage of distinct values
+nrow(prft_mv %>% distinct(director))/nrow(prft_mv)
+nrow(prft_mv %>% distinct(actor1))/nrow(prft_mv)
+nrow(prft_mv %>% distinct(actor2))/nrow(prft_mv)
+nrow(prft_mv %>% distinct(actor3))/nrow(prft_mv)
+nrow(prft_mv %>% distinct(actor4))/nrow(prft_mv)
+nrow(prft_mv %>% distinct(actor5))/nrow(prft_mv)
+
+```
+
+<h1>Part V: Critiques</h1>
+Besides the conclusions we listed above about this dataset, we also provide a brief critique on our analysis methods: First, we should control for the theater-released year in all the analyses that involve profits, because the trends of profitability across other variables (e.g. genre, mpaa rating. etc) may change when we take inflation into consideration. In addition, when we analyze the public rating of these movies, our conclusions might be more insightful if we examine the trends each 10 years from 1970 to 2014, since how the public rate the movies may change over time with cultural and technological development. Apart from considering what might be affected by time (i.e. theater-released year), we should also be more careful about conclusions we draw when we compare movies across their genre or mpaa rating, because the sample size of each genre/mpaa rating varies a lot; for example, if one genre of movies only has a sample size less than 5 in our dataset, the conclusions we draw from this dataset about this genre of movies may not be accurate or representative. In the future, we should improve on all the aforementioned aspects of data analysis if we extend this project further. 
