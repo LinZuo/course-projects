@@ -1,0 +1,541 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+header-includes: \usepackage[utf8]{inputenc} \usepackage{amsmath} \usepackage{amssymb}
+  \usepackage{amsthm} \usepackage{mathtools} \usepackage{dsfont}
+---
+
+## Code
+```{r}
+library(igraph)
+library(MCMCpack)
+library(ggplot2)
+set.seed(20184015)
+knitr::opts_chunk$set(cache=TRUE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=65),tidy=TRUE)
+```
+
+## Generating Process
+1. For each node i, draw mixed-membership vector $\pi_{i} \sim Dirichlet(\alpha)$
+2. For each node i, draw its sender probability $\lambda_{i}$
+3. Choose N ~ Poisson($\epsilon$): number of emails
+4. For each email n
+    a) For each node i, draw $z_{ni} \sim Multinomial(\pi_{i})$
+    b) Pick node u as a sender (i.e., Sn = u) among all the nodes with probabiltiy $\lambda_{u}$
+    c) For each node j $\neq$ u, draw $Y_{n,j} \sim Bernoulli(z_{nu}Bz_{nj}^{T})$
+
+```{r}
+# number of nodes
+M <- 65
+# number of emails
+N <- 650
+# number of groups
+K <- 4
+# alpha, parameter for the Dirichlet distribution
+alpha <- 0.25
+
+# interaction matrix - ground truth
+B <- matrix(c(0.01, 0.01, 0.1, 0.1, 0.2, 0.3, 0.01, 0.01, 0.01, 0.2, 0.01, 0.01, 0.01, 0.1, 0.3, 0.3), nrow = 4)
+
+# simulate mixed membership probability vector for all nodes
+pi_mat <- matrix(nrow = M, ncol = K)
+for (i in 1:M) {
+  pi_mat[i,] <- rdirichlet(1, rep(alpha, K))
+}
+
+# simulate lambda, friendship value
+mu <- 0
+sig <- 1
+lambda <- rnorm(M, mu, sqrt(sig))
+# calculate probability for each node i as a sender among all the nodes
+sender_prob_vec <- exp(lambda) / sum(exp(lambda))
+sender_vec <- numeric(N)
+
+# Y matrix - ground truth about all transactions
+Y <- matrix(0, nrow = N, ncol = M)
+
+# step 4 in the generating process
+for (i in 1:N) {
+  Zn <- matrix(nrow = M, ncol = K)
+  for (j in 1:M) {
+    Zn[j,] <- rmultinom(1, 1, pi_mat[j,])
+  }
+  u <- sample(1:M, 1, replace = FALSE, prob = sender_prob_vec)
+  sender_vec[i] <- u
+  for (j in 1:M) {
+    if (j != u) {
+      Y[i,j] <- rbinom(1, 1, prob = (t(Zn[u,]) %*% B %*% Zn[j,]) )
+    }
+  }
+}
+
+# adjacency matrix for the simulated network
+adj.simulated <- matrix(0, nrow = M, ncol = M)
+for (i in 1:N) {
+  for (j in 1:M) {
+    if (Y[i,j] == 1) {
+      adj.simulated[sender_vec[i], j] = 1
+    }
+  }
+}
+
+```
+
+```{r}
+# for each node i, choose the group for which it has the largest group membership probability
+makeClusters <- function(pi_mat, adj.simulated, K) {
+  clusters <- numeric(nrow(pi_mat))
+  for (i in 1:nrow(pi_mat)) {
+    clusters[i] <- which(pi_mat[i,] %in% max(pi_mat[i,]))
+  }
+  
+  copy_Y <- adj.simulated
+  final_Y <- copy_Y[order(clusters), order(clusters)]
+  print(order(clusters))
+  return(final_Y)
+}
+```
+```{r}
+# K = 4, alpha = 0.25
+res <- makeClusters(pi_mat, adj.simulated, 4)
+g <- graph.adjacency(res, mode="directed")
+image(res[65:1,], zlim=c(0,1), col =c("black","white"))
+
+```
+
+Under the model, the joint distribution over latent variables and observations is 
+$$
+p(Y, S, \pi_{1:M}, \lambda_{1:M}, Z_{1:N,1:M} | \  \alpha, B, \mu) = \\
+\prod_{m=1}^{M} p(\pi_m\ |\ \alpha) \prod_{m=1}^{M} p(\lambda_m\ |\ \mu) \times \\
+\prod_{n=1}^{N} [p(S_n\ |\ \lambda) \prod_{m=1}^{M} p(z_{nm}\ |\ \pi_m) \prod_{m=1, m \neq S_n}^{M} p(Y_{n,m}\ |\ Z_{nm}, Z_{nS_n}, B)]
+$$
+
+Our focus is to estimate groups and membership, and then ultimately recover the B matrix. In the following derivation we condition on senders $S_n$, eliminating the need to infer the $\lambda$'s.
+
+Let's treat $\{\pi_{M*K}, Z_{N*M*K}\} \equiv \theta$ as random latent variables and $B$ as the fixed parameter that we want to estimate. 
+
+Estimate the posterior distribution 
+$$
+p(\theta\ |\ Y, B) = \frac{p(Y| \theta, B) p(\theta|B)}{p(Y|B)}
+$$
+$p(Y|B)$ is intractable, so we use variational methods to approximate the posterior $p(\theta\ |\ Y, B)$.
+
+We set the variational distribution as $q(\pi_{1:M}, Z_{1:N,1:M}) = \prod_{m=1}^{M} q_1(\pi_m\ |\ \gamma_m) \prod_{n=1}^{N} \prod_{m=1}^{M} q_2(z_{n,m}|\phi_{n,m})$, where $q_1$ is a Dirichlet distribution and $q_2$ is a multinomial distribution. $\{\gamma_{1:M}, \phi_{1:N, 1:M}\}$ are free variational parameters that we will optimize.
+
+The update for variational parameters $\phi_{nm}$ is
+$$
+\phi_{nm,k} \propto E_q(log(\pi_{m,k})) \times \\
+\prod_{l=1}^{K} \Big(B_{lk}^{Y_{nm}} (1-B_{lk})^{1-Y_{nm}}\Big) ^{\phi_{nS_n,l} \times \p {m \neq S_n}} \times \\
+\prod_{m'\neq m} \prod_{l=1}^{K} \Big(B_{kl}^{Y_{nm'}} (1-B_{kl})^{1-Y_{nm'}}\Big) ^{\phi_{nm',l} \times \1{m = S_n}}
+$$
+for all transactions $n = 1,..., M$ and all nodes $m = 1, ..., M$
+
+The update for variational parameter $\gamma$ is 
+$$
+\gamma_{m,k} = \alpha_k + \sum_{n=1}^{N} \phi_{nm,k}
+$$
+for all nodes $m = 1,...,M$. 
+
+The empirical Bayes estimate for B is 
+(this result is from the paper, and we think it seems to be correct by comparing it with the form of the estimated B from MMSB paper)
+$$
+B_{k,l} = \frac{\sum_{n=1}^{N}\sum_{m=1, m \ne Sn}^{M}\phi_{nSn,k}\phi_{nm,l}Y_{nm}}{\sum_{n=1}^{N} \sum_{m=1, m\ne Sn}^{M} \phi_{nSn,k} \phi_{nm,l}}
+$$
+
+# 1. Randomly initialized B matrix
+```{r}
+set.seed(20184025)
+alpha <- 0.1
+
+# initialization rule from the paper
+gamma_mat <- matrix(N/K, nrow = M, ncol = K)
+phi_mat <- array(rep(1/K, N*M*K), dim = c(N,M,K))
+# randomly initialize B
+B.estimate <- matrix(rbeta(16,2,2), nrow = K, ncol = K)
+
+log.likelihood.Mstep <- numeric(10)
+
+for (i in 21:30) {
+  # E-step
+  log.likelihood.Estep <- numeric(10)
+  for(a in 1:100) {
+    # update phi
+    for (n in 1:N) {
+      Sn <- sender_vec[n]
+      
+      for (m in 1:M) {
+        gamma_m <- gamma_mat[m,]
+        
+        expected_log_pi <- as.numeric(NA)
+        for (t in 1:K) {
+          expected_log_pi[t] <- digamma(gamma_m[t]) - digamma(sum(gamma_m))
+        }
+        
+        if (m != Sn) {
+          for (k in 1:K) {
+            second_item <- 0
+            for (l in 1:K) {
+              second_item <- second_item + phi_mat[n, Sn, l] * log(B.estimate[l,k]^Y[n,m] * (1 - B.estimate[l,k])^(1- Y[n,m]))
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(second_item)
+          }
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        } 
+        if (m == Sn) {
+          for (k in 1:K) {
+            third_item <- 0
+            for (mp in 1:M) {
+              if (mp != m) {
+                for (l in 1:K) {
+                  third_item <- third_item  + (phi_mat[n, mp, l]) * 
+                    log(B.estimate[k,l]^Y[n,mp] * (1 - B.estimate[k,l])^(1 - Y[n,mp]))
+                }
+              }
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(third_item)
+          } 
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        }
+      }
+    }
+    
+    # update gamma
+    for (m in 1:M) {
+      for (k in 1:K) {
+        sum <- alpha
+        for (n in 1:N){
+          sum <- sum + phi_mat[n,m,k]
+        }
+        gamma_mat[m,k] <- sum
+      }
+    }
+    
+    new_pi <- matrix(NA, nrow = M, ncol = K)
+    # mixed membership vectors for all nodes after VB
+    for (s in 1:M){
+      new_pi[s,] <- gamma_mat[s,]/sum(gamma_mat[s,])
+    }
+    
+    l <- 0
+    for (n in 1:N) {
+      sender <- sender_vec[n]
+      for (m in 1:M) {
+        if (m != sender) {
+          p <- new_pi[sender, ] %*% B.estimate %*% new_pi[m, ]
+          l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+        }
+      }
+    }
+    log.likelihood.Estep[a] <- l
+  }
+  
+  # estimate B
+  for (k in 1:K) {
+    for (l in 1:K) {
+      numerator <- 0
+      denominator <- 0
+      for (n in 1:N) {
+        Sn <- sender_vec[n]
+        for (m in 1:M) {
+          if (m != Sn) {
+            numerator <- numerator + phi_mat[n, Sn, k] * phi_mat[n, m, l] * Y[n, m]
+            denominator <- denominator + phi_mat[n, Sn, k] * phi_mat[n, m, l]
+          }
+        }
+      }
+      B.estimate[k,l] <- numerator / denominator
+    }
+  }
+  
+  # calculate likelihood
+  l <- 0
+  for (n in 1:N) {
+    sender <- sender_vec[n]
+    for (m in 1:M) {
+      if (m != sender) {
+        p <- new_pi[sender, ] %*% B.estimate %*% new_pi[m, ]
+        l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+      }
+    }
+  }
+  log.likelihood.Mstep[i] <- l
+  
+  print(cbind(round(B.estimate,2),0,B))
+  print(sum((c(B)-c(B.estimate))^2))
+  print(i)
+}
+```
+
+# 2. Ground truth
+```{r}
+set.seed(20184025)
+alpha <- 0.1
+
+# initialization rule from the paper
+gamma_mat <- matrix(N/K, nrow = M, ncol = K)
+phi_mat <- array(rep(1/K, N*M*K), dim = c(N,M,K))
+# ground truth B provided in the paper
+B.estimate.truth <- matrix(c(0.01,0.01,0.1,0.1,0.2,0.3,0.01,0.01,0.01,0.2,0.01,0.01,0.01,0.1,0.3,0.3), nrow = K, ncol = K)
+
+log.likelihood.Mstep <- numeric(30)
+
+for (i in 71:80) {
+  # E-step
+  log.likelihood.Estep <- numeric(100)
+  for(a in 1:100) {
+    # update phi
+    for (n in 1:N) {
+      Sn <- sender_vec[n]
+      
+      for (m in 1:M) {
+        gamma_m <- gamma_mat[m,]
+        
+        expected_log_pi <- as.numeric(NA)
+        for (t in 1:K) {
+          expected_log_pi[t] <- digamma(gamma_m[t]) - digamma(sum(gamma_m))
+        }
+        
+        if (m != Sn) {
+          for (k in 1:K) {
+            second_item <- 0
+            for (l in 1:K) {
+              second_item <- second_item + phi_mat[n, Sn, l] * log(B.estimate.truth[l,k]^Y[n,m] * (1 - B.estimate.truth[l,k])^(1- Y[n,m]))
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(second_item)
+          }
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        } 
+        if (m == Sn) {
+          for (k in 1:K) {
+            third_item <- 0
+            for (mp in 1:M) {
+              if (mp != m) {
+                for (l in 1:K) {
+                  third_item <- third_item  + (phi_mat[n, mp, l]) * 
+                    log(B.estimate.truth[k,l]^Y[n,mp] * (1 - B.estimate.truth[k,l])^(1 - Y[n,mp]))
+                }
+              }
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(third_item)
+          } 
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        }
+      }
+    }
+    
+    # update gamma
+    for (m in 1:M) {
+      for (k in 1:K) {
+        sum <- alpha
+        for (n in 1:N){
+          sum <- sum + phi_mat[n,m,k]
+        }
+        gamma_mat[m,k] <- sum
+      }
+    }
+    
+    new_pi <- matrix(NA, nrow = M, ncol = K)
+    # mixed membership vectors for all nodes after VB
+    for (s in 1:M){
+      new_pi[s,] <- gamma_mat[s,]/sum(gamma_mat[s,])
+    }
+    
+    l <- 0
+    for (n in 1:N) {
+      sender <- sender_vec[n]
+      for (m in 1:M) {
+        if (m != sender) {
+          p <- new_pi[sender, ] %*% B.estimate.truth %*% new_pi[m, ]
+          l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+        }
+      }
+    }
+    log.likelihood.Estep[a] <- l
+  }
+  
+  # estimate B
+  for (k in 1:K) {
+    for (l in 1:K) {
+      numerator <- 0
+      denominator <- 0
+      for (n in 1:N) {
+        Sn <- sender_vec[n]
+        for (m in 1:M) {
+          if (m != Sn) {
+            numerator <- numerator + phi_mat[n, Sn, k] * phi_mat[n, m, l] * Y[n, m]
+            denominator <- denominator + phi_mat[n, Sn, k] * phi_mat[n, m, l]
+          }
+        }
+      }
+      B.estimate.truth[k,l] <- numerator / denominator
+    }
+  }
+  
+  # calculate likelihood
+  l <- 0
+  for (n in 1:N) {
+    sender <- sender_vec[n]
+    for (m in 1:M) {
+      if (m != sender) {
+        p <- new_pi[sender, ] %*% B.estimate.truth %*% new_pi[m, ]
+        l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+      }
+    }
+  }
+  log.likelihood.Mstep[i] <- l
+  
+  print(cbind(round(B.estimate.truth,2),0,B))
+  print(sum((c(B)-c(B.estimate.truth))^2))
+  print(i)
+}
+```
+
+# 3. Set initial B matrix manually
+```{r}
+set.seed(20184025)
+alpha <- 0.1
+
+# initialization rule from the paper
+gamma_mat <- matrix(N/K, nrow = M, ncol = K)
+phi_mat <- array(rep(1/K, N*M*K), dim = c(N,M,K))
+# manually initialize B to the estimated B matrix in the paper
+B.estimate.hand <- matrix(c(0.0127,0.0064,0.0964,0.0979,0.2012,0.3055,0.0207,0.0243,0.0149,0.2064,0.0146,0.0164,0.0115,0.0802,0.2959,0.2733), nrow = K, ncol = K)
+
+log.likelihood.Mstep <- numeric(30)
+for (i in 51:70) {
+  # E-step
+  log.likelihood.Estep <- numeric(100)
+  for(a in 1:100) {
+    # update phi
+    for (n in 1:N) {
+      Sn <- sender_vec[n]
+      
+      for (m in 1:M) {
+        gamma_m <- gamma_mat[m,]
+        
+        expected_log_pi <- as.numeric(NA)
+        for (t in 1:K) {
+          expected_log_pi[t] <- digamma(gamma_m[t]) - digamma(sum(gamma_m))
+        }
+        
+        if (m != Sn) {
+          for (k in 1:K) {
+            second_item <- 0
+            for (l in 1:K) {
+              second_item <- second_item + phi_mat[n, Sn, l] * log(B.estimate.hand[l,k]^Y[n,m] * (1 - B.estimate.hand[l,k])^(1- Y[n,m]))
+              #print(paste(l, k, m, n, second_item,sep=", "))
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(second_item)
+          }
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        } 
+        if (m == Sn) {
+          for (k in 1:K) {
+            third_item <- 0
+            for (mp in 1:M) {
+              if (mp != m) {
+                for (l in 1:K) {
+                  third_item <- third_item  + (phi_mat[n, mp, l]) * 
+                    log(B.estimate.hand[k,l]^Y[n,mp] * (1 - B.estimate.hand[k,l])^(1 - Y[n,mp]))
+                }
+              }
+            }
+            phi_mat[n,m,k] <- exp(expected_log_pi[k]) * exp(third_item)
+          } 
+          phi_mat[n,m,] <- phi_mat[n,m,] / sum(phi_mat[n,m,])
+        }
+      }
+    }
+    
+    # update gamma
+    for (m in 1:M) {
+      for (k in 1:K) {
+        sum <- alpha
+        for (n in 1:N){
+          sum <- sum + phi_mat[n,m,k]
+        }
+        gamma_mat[m,k] <- sum
+      }
+    }
+    
+    new_pi <- matrix(NA, nrow = M, ncol = K)
+    # mixed membership vectors for all nodes after VB
+    for (s in 1:M){
+      new_pi[s,] <- gamma_mat[s,]/sum(gamma_mat[s,])
+    }
+    
+    l <- 0
+    for (n in 1:N) {
+      sender <- sender_vec[n]
+      for (m in 1:M) {
+        if (m != sender) {
+          p <- new_pi[sender, ] %*% B.estimate.hand %*% new_pi[m, ]
+          l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+        }
+      }
+    }
+    log.likelihood.Estep[a] <- l
+  }
+  
+  # estimate B
+  for (k in 1:K) {
+    for (l in 1:K) {
+      numerator <- 0
+      denominator <- 0
+      for (n in 1:N) {
+        Sn <- sender_vec[n]
+        for (m in 1:M) {
+          if (m != Sn) {
+            numerator <- numerator + phi_mat[n, Sn, k] * phi_mat[n, m, l] * Y[n, m]
+            denominator <- denominator + phi_mat[n, Sn, k] * phi_mat[n, m, l]
+          }
+        }
+      }
+      B.estimate.hand[k,l] <- numerator / denominator
+    }
+  }
+  
+  # calculate likelihood
+  l <- 0
+  for (n in 1:N) {
+    sender <- sender_vec[n]
+    for (m in 1:M) {
+      if (m != sender) {
+        p <- new_pi[sender, ] %*% B.estimate.hand %*% new_pi[m, ]
+        l <- l + log(p^Y[n,m]) + log((1-p)^(1-Y[n,m]))
+      }
+    }
+  }
+  log.likelihood.Mstep[i] <- l
+  
+  print(cbind(round(B.estimate.hand,2),0,B))
+  print(sum((c(B)-c(B.estimate.hand))^2))
+  print(i)
+}
+```
+
+
+```{r}
+# calculate BIC
+likelihood <- 1
+for (n in 1:N) {
+  Sn <- sender_vec[n]
+  for (m in 1:M) {
+    if (m != Sn) {
+      p_ij <- pi_mat_recovered[Sn,] %*% B.estimate %*% t(pi_mat_recovered[m,])
+      likelihood <- likelihood * p_ij^Y[n,m] * (1-p_ij)^(1-Y[n,m])
+    }
+  }
+}
+BIC <- 2 * log(likelihood)
+```
+
+```{r}
+# MMSB
+library(lda)
+fit  <- mmsb.collapsed.gibbs.sampler(network=adj.simulated,K=4, num.iterations=10000, alpha=0.1, beta.prior=list(matrix(1,4,4), matrix(1,4,4)))
+recovered_B_lda <- fit$blocks.pos / (fit$blocks.pos + fit$blocks.neg)
+```
+
